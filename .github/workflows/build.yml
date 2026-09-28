@@ -1,0 +1,89 @@
+name: Build livesync-bridge image
+
+# Tracks https://github.com/vrtmrz/livesync-bridge (the author publishes no
+# image). Builds from the upstream HEAD commit, pinned by SHA, and publishes to
+# ghcr.io so Unraid's dockerMan can detect updates the same way it does for any
+# registry image.
+#
+# A new image is only pushed when upstream moved (tag <sha12> not yet in ghcr).
+# Re-running with `force: true` rebuilds the current HEAD anyway (e.g. to pick
+# up base-image security updates).
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if this upstream commit was already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM: https://github.com/vrtmrz/livesync-bridge.git
+  IMAGE: ghcr.io/${{ github.repository_owner }}/livesync-bridge
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve upstream HEAD
+        id: upstream
+        run: |
+          sha=$(git ls-remote "$UPSTREAM" HEAD | cut -f1)
+          [ -n "$sha" ] || { echo "could not resolve upstream HEAD" >&2; exit 1; }
+          echo "sha=$sha"       >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "upstream HEAD = $sha"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if this commit is already published
+        id: check
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ "$FORCE" != "true" ] && docker manifest inspect "$IMAGE:${{ steps.upstream.outputs.short }}" >/dev/null 2>&1; then
+            echo "already published, nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Buildx
+        if: steps.check.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.check.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: "${{ env.UPSTREAM }}#${{ steps.upstream.outputs.sha }}"
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.upstream.outputs.short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+            org.opencontainers.image.url=https://github.com/vrtmrz/livesync-bridge
+            org.opencontainers.image.description=Self-hosted LiveSync bridge (vrtmrz/livesync-bridge), built from upstream commit ${{ steps.upstream.outputs.short }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### livesync-bridge"
+            echo "- upstream commit: \`${{ steps.upstream.outputs.sha }}\`"
+            echo "- built: ${{ steps.check.outputs.build }}"
+            echo "- image: \`$IMAGE:latest\` / \`$IMAGE:${{ steps.upstream.outputs.short }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
